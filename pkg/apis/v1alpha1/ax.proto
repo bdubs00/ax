@@ -78,6 +78,42 @@ message TaskSpec {
   // debug enables the in-container guest services (process execution and file
   // access) that back `ax ssh`. Off by default.
   bool debug = 6;
+  // egress allows the task outbound connections. Agent Substrate denies every
+  // connection of an actor that has no egress policy, so a task without this
+  // field has no network access at all. The controller writes the rules to the
+  // actor's egress policy before the task first runs. Tasks are immutable, so
+  // the policy is created once.
+  EgressSpec egress = 7;
+}
+
+// EgressSpec is the outbound traffic that a task may open. Traffic that no
+// rule allows is refused.
+message EgressSpec {
+  repeated EgressRule rules = 1;
+}
+
+// EgressRule allows one protocol to a set of destinations. Exactly one of
+// http, https, and tls is set.
+message EgressRule {
+  // http allows cleartext HTTP, including h2c, to the hosts. The default port
+  // is 80.
+  EgressHosts http = 1;
+  // https allows HTTPS that the egress gateway intercepts, so the task must
+  // trust the gateway CA. The default port is 443.
+  EgressHosts https = 2;
+  // tls allows TLS that the egress gateway forwards without decryption, for any
+  // protocol carried over TLS. The default port is 443.
+  EgressHosts tls = 3;
+}
+
+// EgressHosts names the destinations of a rule.
+message EgressHosts {
+  // hostnames are DNS names, lowercase and without a trailing dot. A leading
+  // "*." matches exactly one label, and "*" alone matches every name.
+  repeated string hostnames = 1;
+  // ports are the destination ports. Empty means the default port of the
+  // protocol.
+  repeated int32 ports = 2;
 }
 
 message EnvVar {

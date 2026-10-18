@@ -50,6 +50,9 @@ type mockControlServer struct {
 	resumeActorErr    error
 	crashedActor      string
 	revertedActors    []string
+	egressPolicies    map[string]*ateapipb.EgressPolicy // by actor name
+	egressPolicyErr   error
+	calls             []string // the order of the actor calls: create, egress, resume, suspend
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -98,12 +101,29 @@ func (m *mockControlServer) CreateActor(ctx context.Context, req *ateapipb.Creat
 		return nil, status.Error(codes.AlreadyExists, "actor exists")
 	}
 	m.createdActors = append(m.createdActors, name)
+	m.calls = append(m.calls, "create "+name)
 	return &ateapipb.Actor{
 		Metadata: &ateapipb.ResourceMetadata{Name: name},
 		Status: &ateapipb.ActorStatus{
 			State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
 		},
 	}, nil
+}
+
+func (m *mockControlServer) CreateActorEgressPolicy(ctx context.Context, req *ateapipb.CreateActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
+	if m.egressPolicyErr != nil {
+		return nil, m.egressPolicyErr
+	}
+	name := req.GetActor().GetName()
+	if m.egressPolicies == nil {
+		m.egressPolicies = make(map[string]*ateapipb.EgressPolicy)
+	}
+	if _, ok := m.egressPolicies[name]; ok {
+		return nil, status.Error(codes.AlreadyExists, "egress policy exists")
+	}
+	m.egressPolicies[name] = req.GetEgressPolicy()
+	m.calls = append(m.calls, "egress "+name)
+	return req.GetEgressPolicy(), nil
 }
 
 func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
@@ -115,6 +135,7 @@ func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.Resum
 		name = req.Actor.Name
 	}
 	m.resumedActors = append(m.resumedActors, name)
+	m.calls = append(m.calls, "resume "+name)
 	wIP := "10.244.1.42"
 	if m.workerIP != "" {
 		wIP = m.workerIP
@@ -274,6 +295,189 @@ func TestTaskReconciler(t *testing.T) {
 	}
 	if len(mockSrv.resumedActors) != 1 || mockSrv.resumedActors[0] != "test-task" {
 		t.Errorf("expected actor 'test-task' resumed, got %v", mockSrv.resumedActors)
+	}
+}
+
+// A task with spec.egress gets an egress policy on its actor, with the rules
+// of the task and the default ports of the protocols, before the actor first
+// resumes. A second reconcile leaves the policy alone.
+func TestTaskReconciler_EgressPolicy(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace)
+	reconciler.SecretResolver = noSecrets
+	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+
+	task := &v1alpha1.Task{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata:   &v1alpha1.ObjectMeta{Name: "net-task", Atespace: "default"},
+		Spec: &v1alpha1.TaskSpec{
+			Image: "ghcr.io/my-org/my-image",
+			Egress: &v1alpha1.EgressSpec{Rules: []*v1alpha1.EgressRule{
+				{Https: &v1alpha1.EgressHosts{Hostnames: []string{"generativelanguage.googleapis.com"}}},
+				{Http: &v1alpha1.EgressHosts{Hostnames: []string{"nats.agents.svc.cluster.local"}, Ports: []int32{8080}}},
+				{Tls: &v1alpha1.EgressHosts{Hostnames: []string{"github.com", "*.github.com"}}},
+			}},
+		},
+		Status: &v1alpha1.TaskStatus{Phase: "Running"},
+	}
+	reconciled, err := reconciler.Reconcile(ctx, task)
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if reconciled.Status.Phase != "Running" {
+		t.Errorf("expected phase 'Running', got %q", reconciled.Status.Phase)
+	}
+	policy := mockSrv.egressPolicies["net-task"]
+	if policy == nil {
+		t.Fatalf("no egress policy was created; calls %v", mockSrv.calls)
+	}
+	if policy.GetMetadata().GetName() != "default" || policy.GetMetadata().GetAtespace() != "default" {
+		t.Errorf("policy metadata = %v, want name default in atespace default", policy.GetMetadata())
+	}
+	rules := policy.GetRules()
+	if len(rules) != 3 {
+		t.Fatalf("rules = %v, want 3", rules)
+	}
+	if h := rules[0].GetHttps(); h == nil || h.GetHostnames()[0] != "generativelanguage.googleapis.com" || len(h.GetPorts().GetNumbers()) != 1 || h.GetPorts().GetNumbers()[0] != 443 {
+		t.Errorf("https rule = %v, want the host on port 443 by default", rules[0])
+	}
+	if h := rules[1].GetHttp(); h == nil || h.GetHostnames()[0] != "nats.agents.svc.cluster.local" || h.GetPorts().GetNumbers()[0] != 8080 {
+		t.Errorf("http rule = %v, want the host on port 8080", rules[1])
+	}
+	if p := rules[2].GetTlsPassthrough(); p == nil || len(p.GetHostnames()) != 2 || p.GetPorts().GetNumbers()[0] != 443 {
+		t.Errorf("tls rule = %v, want two hosts on port 443 by default", rules[2])
+	}
+	// The policy exists before the actor first runs.
+	want := []string{"create net-task", "egress net-task", "resume net-task"}
+	if len(mockSrv.calls) != len(want) {
+		t.Fatalf("calls = %v, want %v", mockSrv.calls, want)
+	}
+	for i := range want {
+		if mockSrv.calls[i] != want[i] {
+			t.Fatalf("calls = %v, want %v", mockSrv.calls, want)
+		}
+	}
+	// A second reconcile finds the policy and keeps it.
+	if _, err := reconciler.Reconcile(ctx, reconciled); err != nil {
+		t.Fatalf("second Reconcile failed: %v", err)
+	}
+	if len(mockSrv.egressPolicies) != 1 {
+		t.Errorf("policies after the second reconcile = %d, want 1", len(mockSrv.egressPolicies))
+	}
+}
+
+// A task without spec.egress gets no policy, as before.
+func TestTaskReconciler_NoEgress(t *testing.T) {
+	ctx := context.Background()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer lis.Close()
+	mockSrv := &mockControlServer{}
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	defer grpcServer.Stop()
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	defer client.Close()
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace)
+	reconciler.SecretResolver = noSecrets
+	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+	task := &v1alpha1.Task{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata:   &v1alpha1.ObjectMeta{Name: "plain-task", Atespace: "default"},
+		Spec:       &v1alpha1.TaskSpec{Image: "ghcr.io/my-org/my-image"},
+		Status:     &v1alpha1.TaskStatus{Phase: "Running"},
+	}
+	if _, err := reconciler.Reconcile(ctx, task); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if len(mockSrv.egressPolicies) != 0 {
+		t.Errorf("a task without egress got a policy: %v", mockSrv.egressPolicies)
+	}
+}
+
+// A policy that Substrate refuses fails the task with a reason, and a
+// Substrate that is unavailable leaves it pending.
+func TestTaskReconciler_EgressPolicyError(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name   string
+		err    error
+		phase  string
+		reason string
+	}{
+		{"refused", status.Error(codes.InvalidArgument, "two rules match the same pattern"), "Failed", "EgressPolicyFailed"},
+		{"unavailable", status.Error(codes.Unavailable, "ate-api-server is down"), "Pending", "SubstrateUnavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("failed to listen: %v", err)
+			}
+			defer lis.Close()
+			mockSrv := &mockControlServer{egressPolicyErr: tc.err}
+			grpcServer := grpc.NewServer()
+			ateapipb.RegisterControlServer(grpcServer, mockSrv)
+			go grpcServer.Serve(lis)
+			defer grpcServer.Stop()
+			client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatalf("failed to create substrate client: %v", err)
+			}
+			defer client.Close()
+			reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace)
+			reconciler.SecretResolver = noSecrets
+			task := &v1alpha1.Task{
+				ApiVersion: v1alpha1.APIVersion,
+				Kind:       v1alpha1.KindTask,
+				Metadata:   &v1alpha1.ObjectMeta{Name: "net-task", Atespace: "default"},
+				Spec: &v1alpha1.TaskSpec{Image: "ghcr.io/my-org/my-image", Egress: &v1alpha1.EgressSpec{Rules: []*v1alpha1.EgressRule{
+					{Https: &v1alpha1.EgressHosts{Hostnames: []string{"example.com"}}},
+				}}},
+				Status: &v1alpha1.TaskStatus{Phase: "Running"},
+			}
+			reconciled, err := reconciler.Reconcile(ctx, task)
+			if err == nil {
+				t.Fatal("Reconcile succeeded, want an error")
+			}
+			if reconciled.Status.Phase != tc.phase {
+				t.Errorf("phase = %q, want %q", reconciled.Status.Phase, tc.phase)
+			}
+			found := false
+			for _, c := range reconciled.Status.Conditions {
+				if c.GetType() == "Ready" && c.GetReason() == tc.reason {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("conditions = %v, want Ready with reason %s", reconciled.Status.Conditions, tc.reason)
+			}
+			if len(mockSrv.resumedActors) != 0 {
+				t.Errorf("the actor was resumed without its policy: %v", mockSrv.resumedActors)
+			}
+		})
 	}
 }
 

@@ -595,3 +595,45 @@ func TestValidateWorkspace_Files(t *testing.T) {
 		t.Errorf("expected path is required error, got %v", err)
 	}
 }
+
+func TestValidateTask_Egress(t *testing.T) {
+	task := func(rules ...*v1alpha1.EgressRule) *v1alpha1.Task {
+		return &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "t", Atespace: "default"},
+			Spec:     &v1alpha1.TaskSpec{Egress: &v1alpha1.EgressSpec{Rules: rules}},
+		}
+	}
+	hosts := func(ports ...int32) *v1alpha1.EgressHosts {
+		return &v1alpha1.EgressHosts{Hostnames: []string{"api.example.com", "*.googleapis.com", "*"}, Ports: ports}
+	}
+	cases := []struct {
+		name string
+		task *v1alpha1.Task
+		want string // a fragment of the error, or "" for a valid task
+	}{
+		{"no egress", &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "t"}, Spec: &v1alpha1.TaskSpec{}}, ""},
+		{"empty egress", task(), ""},
+		{"http https tls", task(&v1alpha1.EgressRule{Http: hosts()}, &v1alpha1.EgressRule{Https: hosts(443, 8443)}, &v1alpha1.EgressRule{Tls: hosts(443)}), ""},
+		{"no protocol", task(&v1alpha1.EgressRule{}), "exactly one of http, https, and tls"},
+		{"two protocols", task(&v1alpha1.EgressRule{Http: hosts(), Https: hosts()}), "exactly one of http, https, and tls"},
+		{"no hostname", task(&v1alpha1.EgressRule{Https: &v1alpha1.EgressHosts{}}), "at least one hostname"},
+		{"uppercase hostname", task(&v1alpha1.EgressRule{Https: &v1alpha1.EgressHosts{Hostnames: []string{"API.example.com"}}}), `hostname "API.example.com"`},
+		{"trailing dot", task(&v1alpha1.EgressRule{Https: &v1alpha1.EgressHosts{Hostnames: []string{"example.com."}}}), `hostname "example.com."`},
+		{"wildcard inside", task(&v1alpha1.EgressRule{Https: &v1alpha1.EgressHosts{Hostnames: []string{"api.*.example.com"}}}), `hostname "api.*.example.com"`},
+		{"url", task(&v1alpha1.EgressRule{Https: &v1alpha1.EgressHosts{Hostnames: []string{"https://example.com"}}}), `hostname "https://example.com"`},
+		{"port zero", task(&v1alpha1.EgressRule{Http: hosts(0)}), "port 0 is not between"},
+		{"port too large", task(&v1alpha1.EgressRule{Http: hosts(70000)}), "port 70000 is not between"},
+		{"port twice", task(&v1alpha1.EgressRule{Http: hosts(80, 80)}), "port 80 is listed twice"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := v1alpha1.ValidateTask(tc.task)
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("ValidateTask = %v, want nil", err)
+			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+				t.Fatalf("ValidateTask = %v, want an error with %q", err, tc.want)
+			}
+		})
+	}
+}

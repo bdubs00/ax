@@ -36,6 +36,13 @@ spec:
       path: "/workspace"
 
   debug: true # serve guest services so `ax ssh` works; off by default
+
+  # The outbound connections the task may open. Without this section the
+  # task has no network access at all.
+  egress:
+    rules:
+      - https: {hostnames: [generativelanguage.googleapis.com]}
+      - tls: {hostnames: [github.com, "*.github.com"]}
 ---
 apiVersion: ax.io/v1alpha1
 kind: Workspace

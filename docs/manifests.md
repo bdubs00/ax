@@ -33,7 +33,19 @@ spec:
       goal: "Install dependencies and run the test suite"   # Antigravity prepares the workspace to this goal on first run
 
   debug: true   # serve guest services inside the sandbox so `ax ssh` works; off by default
+
+  egress:       # the outbound connections the task may open; without it the task has no network
+    rules:
+      - https: {hostnames: [generativelanguage.googleapis.com]}       # port 443 by default
+      - http: {hostnames: [nats.agents.svc.cluster.local], ports: [8080]}
+      - tls: {hostnames: [github.com, "*.github.com"]}                 # forwarded without decryption
 ```
+
+### Network access
+
+Agent Substrate denies every connection of an actor that has no egress policy, so a task without `spec.egress` has no network access at all: it cannot call a model API, clone a repository at runtime, or install a package. `spec.egress.rules` lists what the task may reach, and the controller writes the rules to the actor's egress policy before the task first runs. Tasks are immutable, so the policy is created once.
+
+Each rule sets exactly one protocol and names its destinations. `http` allows cleartext HTTP, including h2c as gRPC uses it, on port 80 unless `ports` says otherwise. `https` allows HTTPS that the egress gateway intercepts and re-originates, on port 443 unless `ports` says otherwise; the task must trust the gateway CA, which Substrate installs in the sandbox. `tls` allows TLS that the gateway forwards without decryption, for any protocol carried over TLS, on port 443 unless `ports` says otherwise. A hostname is a lowercase DNS name without a trailing dot; `*.example.com` matches exactly one label, and `*` alone matches every name. Traffic that no rule allows is refused. See [`docs/networking.md`](networking.md#egress) for what the gateway does with each protocol.
 
 ### Binding several workspaces
 

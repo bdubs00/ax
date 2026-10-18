@@ -468,6 +468,28 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 	return actor, nil
 }
 
+// EnsureActorEgressPolicy gives an actor its egress policy: the rules that
+// allow its outbound traffic, under the policy name "default" that Substrate
+// expects. An actor without a policy has no network access. The policy is
+// created once; an actor that already has one keeps it, because tasks are
+// immutable.
+func (c *Client) EnsureActorEgressPolicy(ctx context.Context, atespace, actorName string, rules []*ateapipb.EgressRule) error {
+	req := &ateapipb.CreateActorEgressPolicyRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: atespace, Name: actorName},
+		EgressPolicy: &ateapipb.EgressPolicy{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: atespace, Name: "default"},
+			Rules:    rules,
+		},
+	}
+	if _, err := c.control.CreateActorEgressPolicy(ctx, req); err != nil {
+		if status.Code(err) == codes.AlreadyExists {
+			return nil
+		}
+		return fmt.Errorf("creating egress policy of actor %s/%s: %w", atespace, actorName, err)
+	}
+	return nil
+}
+
 // ResumeActor resumes the specified actor onto a worker and returns the worker details.
 func (c *Client) ResumeActor(ctx context.Context, atespace, actorName string) (*ateapipb.Actor, string, error) {
 	req := &ateapipb.ResumeActorRequest{

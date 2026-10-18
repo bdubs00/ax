@@ -282,6 +282,51 @@ func ValidateObjectMeta(meta *ObjectMeta) error {
 	return nil
 }
 
+// hostnameRegexp matches an egress hostname pattern: a lowercase DNS name of
+// labels separated by dots, with "*" allowed as the whole leftmost label.
+var hostnameRegexp = regexp.MustCompile(`^(\*|[a-z0-9]([-a-z0-9]*[a-z0-9])?)(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+
+// validateEgress reports the first problem with spec.egress: a rule must set
+// exactly one protocol, name at least one hostname in the pattern syntax of
+// the egress gateway, and give ports between 1 and 65535 without repeats. A
+// nil spec is fine; the task then has no network access.
+func validateEgress(e *EgressSpec) error {
+	for i, r := range e.GetRules() {
+		field := fmt.Sprintf("spec.egress.rules[%d]", i)
+		var hosts *EgressHosts
+		n := 0
+		for name, h := range map[string]*EgressHosts{"http": r.GetHttp(), "https": r.GetHttps(), "tls": r.GetTls()} {
+			if h != nil {
+				n++
+				hosts = h
+				field += "." + name
+			}
+		}
+		if n != 1 {
+			return fmt.Errorf("spec.egress.rules[%d]: exactly one of http, https, and tls is required", i)
+		}
+		if len(hosts.GetHostnames()) == 0 {
+			return fmt.Errorf("%s: at least one hostname is required", field)
+		}
+		for _, h := range hosts.GetHostnames() {
+			if len(h) > 253 || !hostnameRegexp.MatchString(h) || strings.Contains(h[1:], "*") {
+				return fmt.Errorf("%s: hostname %q must be a lowercase DNS name without a trailing dot, with \"*\" only as its leftmost label", field, h)
+			}
+		}
+		seen := make(map[int32]bool, len(hosts.GetPorts()))
+		for _, port := range hosts.GetPorts() {
+			if port < 1 || port > 65535 {
+				return fmt.Errorf("%s: port %d is not between 1 and 65535", field, port)
+			}
+			if seen[port] {
+				return fmt.Errorf("%s: port %d is listed twice", field, port)
+			}
+			seen[port] = true
+		}
+	}
+	return nil
+}
+
 // ValidateWorkspace reports the first problem with a workspace that would make
 // it unusable. It is called by the API server before saving.
 func ValidateWorkspace(w *Workspace) error {
@@ -339,6 +384,9 @@ func ValidateTask(t *Task) error {
 			return fmt.Errorf("%s: path %q is already used by workspace %q", field, paths[i], other)
 		}
 		seen[p] = r.GetName()
+	}
+	if err := validateEgress(spec.GetEgress()); err != nil {
+		return err
 	}
 	return nil
 }

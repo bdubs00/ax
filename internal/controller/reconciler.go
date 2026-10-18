@@ -199,6 +199,23 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		return task, fmt.Errorf("ensuring actor: %w", err)
 	}
 
+	// Give the actor its egress policy before it first runs. Substrate
+	// denies every connection of an actor without one, so a task that names
+	// no egress has no network access. Tasks are immutable, and the policy is
+	// created once.
+	if egress := task.Spec.GetEgress(); egress != nil {
+		if err := r.client.EnsureActorEgressPolicy(ctx, atespace, actorName, egressRules(egress)); err != nil {
+			if substrate.IsTransientError(err) {
+				r.setNotReady(task, "SubstrateUnavailable", err.Error(), now)
+				task.Status.Phase = "Pending"
+				return task, fmt.Errorf("ensuring egress policy: %w", err)
+			}
+			r.setNotReady(task, "EgressPolicyFailed", err.Error(), now)
+			task.Status.Phase = "Failed"
+			return task, fmt.Errorf("ensuring egress policy: %w", err)
+		}
+	}
+
 	// 4. Suspend or Resume the Actor
 	// Tasks are suspended by default upon creation until explicitly resumed to "Running".
 	if task.Status.Phase == "Suspended" || task.Status.Phase == "" {
