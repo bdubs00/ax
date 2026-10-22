@@ -37,12 +37,15 @@ spec:
 
   debug: true # serve guest services so `ax ssh` works; off by default
 
-  # The outbound connections the task may open. Without this section the
-  # task has no network access at all.
+  # The outbound destinations the task may reach. Without this section the
+  # task has no network access at all. A name alone is TLS on port 443,
+  # http:// is cleartext HTTP, and https:// is HTTPS that the egress
+  # gateway intercepts; a port after the name replaces the default.
   egress:
-    rules:
-      - https: {hostnames: [generativelanguage.googleapis.com]}
-      - tls: {hostnames: [github.com, "*.github.com"]}
+    hosts:
+      - https://generativelanguage.googleapis.com
+      - github.com
+      - "*.github.com"
 ---
 apiVersion: ax.io/v1alpha1
 kind: Workspace

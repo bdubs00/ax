@@ -38,12 +38,13 @@ A task has no network access until its actor has an egress policy on Substrate. 
 ```yaml
 spec:
   egress:
-    rules:
-      - https: {hostnames: [generativelanguage.googleapis.com]}
-      - http: {hostnames: [nats.agents.svc.cluster.local], ports: [8080]}
-      - tls: {hostnames: [github.com, "*.github.com"]}
+    hosts:
+      - github.com
+      - "*.github.com"
+      - https://generativelanguage.googleapis.com
+      - http://nats.agents.svc.cluster.local:8080
 ```
 
-The three protocols differ in what the gateway sees. `http` is cleartext, so the gateway decides on each request. `https` is intercepted: the gateway terminates TLS with a certificate from its own CA, decides on each request, and opens its own TLS connection to the destination; the sandbox trusts the gateway CA, so clients inside it do not notice. `tls` is passed through: the gateway decides once per connection on the server name of the ClientHello and forwards the bytes, so it works for any protocol over TLS and inspects nothing. For a given name and port one rule decides, the most specific pattern first, then a named port over all ports. Substrate rejects a policy with two rules on the same pattern and port.
+A host is a DNS name with an optional scheme and an optional port, and the scheme decides what the gateway sees. A name alone is TLS on port 443, passed through: the gateway decides once per connection on the server name of the ClientHello and forwards the bytes, so it works for any protocol over TLS and inspects nothing. `http://` is cleartext HTTP on port 80, so the gateway decides on each request. `https://` is HTTPS on port 443, intercepted: the gateway terminates TLS with a certificate from its own CA, decides on each request, and opens its own TLS connection to the destination; the sandbox trusts the gateway CA, so clients inside it do not notice. A port after the name replaces the default. Each host becomes one rule of the policy. For a given name and port one rule decides, the most specific pattern first. Substrate rejects a policy with two rules on the same pattern and port, so the API server refuses two hosts that name the same host and port.
 
 A task without `spec.egress` gets no policy and no network, which is the safe default. Protocols where the server speaks first after connect, such as plain NATS, do not work through the gateway; use their WebSocket or HTTP forms.

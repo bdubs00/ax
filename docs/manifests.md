@@ -34,18 +34,19 @@ spec:
 
   debug: true   # serve guest services inside the sandbox so `ax ssh` works; off by default
 
-  egress:       # the outbound connections the task may open; without it the task has no network
-    rules:
-      - https: {hostnames: [generativelanguage.googleapis.com]}       # port 443 by default
-      - http: {hostnames: [nats.agents.svc.cluster.local], ports: [8080]}
-      - tls: {hostnames: [github.com, "*.github.com"]}                 # forwarded without decryption
+  egress:       # the outbound destinations the task may reach; without it the task has no network
+    hosts:
+      - github.com                                   # TLS on port 443, forwarded without decryption
+      - "*.github.com"
+      - https://generativelanguage.googleapis.com    # HTTPS that the egress gateway intercepts
+      - http://nats.agents.svc.cluster.local:8080    # cleartext HTTP on that port
 ```
 
 ### Network access
 
-Agent Substrate denies every connection of an actor that has no egress policy, so a task without `spec.egress` has no network access at all: it cannot call a model API, clone a repository at runtime, or install a package. `spec.egress.rules` lists what the task may reach, and the controller writes the rules to the actor's egress policy before the task first runs. Tasks are immutable, so the policy is created once.
+Agent Substrate denies every connection of an actor that has no egress policy, so a task without `spec.egress` has no network access at all: it cannot call a model API, clone a repository at runtime, or install a package. `spec.egress.hosts` lists what the task may reach, and the controller writes the hosts to the actor's egress policy before the task first runs. Tasks are immutable, so the policy is created once.
 
-Each rule sets exactly one protocol and names its destinations. `http` allows cleartext HTTP, including h2c as gRPC uses it, on port 80 unless `ports` says otherwise. `https` allows HTTPS that the egress gateway intercepts and re-originates, on port 443 unless `ports` says otherwise; the task must trust the gateway CA, which Substrate installs in the sandbox. `tls` allows TLS that the gateway forwards without decryption, for any protocol carried over TLS, on port 443 unless `ports` says otherwise. A hostname is a lowercase DNS name without a trailing dot; `*.example.com` matches exactly one label, and `*` alone matches every name. Traffic that no rule allows is refused. See [`docs/networking.md`](networking.md#egress) for what the gateway does with each protocol.
+Each host is a lowercase DNS name without a trailing dot, with an optional scheme and an optional port. A name alone, such as `github.com`, allows TLS on port 443 that the gateway forwards without decryption, so it carries any protocol over TLS and the task needs no extra trust. `http://` allows cleartext HTTP, including h2c as gRPC uses it, on port 80. `https://` allows HTTPS that the egress gateway intercepts and re-originates, on port 443; the task must trust the gateway CA, which Substrate installs in the sandbox. A port after the name, such as `http://nats.agents.svc.cluster.local:8080`, replaces the default of the protocol. `*.example.com` matches exactly one label. Two entries must not name the same host and port, because Substrate refuses such a policy. Traffic that no host allows is refused. See [`docs/networking.md`](networking.md#egress) for what the gateway does with each protocol.
 
 ### Binding several workspaces
 

@@ -298,8 +298,8 @@ func TestTaskReconciler(t *testing.T) {
 	}
 }
 
-// A task with spec.egress gets an egress policy on its actor, with the rules
-// of the task and the default ports of the protocols, before the actor first
+// A task with spec.egress gets an egress policy on its actor, with one rule
+// per host and the default ports of the protocols, before the actor first
 // resumes. A second reconcile leaves the policy alone.
 func TestTaskReconciler_EgressPolicy(t *testing.T) {
 	ctx := context.Background()
@@ -328,10 +328,11 @@ func TestTaskReconciler_EgressPolicy(t *testing.T) {
 		Metadata:   &v1alpha1.ObjectMeta{Name: "net-task", Atespace: "default"},
 		Spec: &v1alpha1.TaskSpec{
 			Image: "ghcr.io/my-org/my-image",
-			Egress: &v1alpha1.EgressSpec{Rules: []*v1alpha1.EgressRule{
-				{Https: &v1alpha1.EgressHosts{Hostnames: []string{"generativelanguage.googleapis.com"}}},
-				{Http: &v1alpha1.EgressHosts{Hostnames: []string{"nats.agents.svc.cluster.local"}, Ports: []int32{8080}}},
-				{Tls: &v1alpha1.EgressHosts{Hostnames: []string{"github.com", "*.github.com"}}},
+			Egress: &v1alpha1.EgressSpec{Hosts: []string{
+				"https://generativelanguage.googleapis.com",
+				"http://nats.agents.svc.cluster.local:8080",
+				"github.com",
+				"*.github.com",
 			}},
 		},
 		Status: &v1alpha1.TaskStatus{Phase: "Running"},
@@ -351,8 +352,8 @@ func TestTaskReconciler_EgressPolicy(t *testing.T) {
 		t.Errorf("policy metadata = %v, want name default in atespace default", policy.GetMetadata())
 	}
 	rules := policy.GetRules()
-	if len(rules) != 3 {
-		t.Fatalf("rules = %v, want 3", rules)
+	if len(rules) != 4 {
+		t.Fatalf("rules = %v, want 4", rules)
 	}
 	if h := rules[0].GetHttps(); h == nil || h.GetHostnames()[0] != "generativelanguage.googleapis.com" || len(h.GetPorts().GetNumbers()) != 1 || h.GetPorts().GetNumbers()[0] != 443 {
 		t.Errorf("https rule = %v, want the host on port 443 by default", rules[0])
@@ -360,8 +361,10 @@ func TestTaskReconciler_EgressPolicy(t *testing.T) {
 	if h := rules[1].GetHttp(); h == nil || h.GetHostnames()[0] != "nats.agents.svc.cluster.local" || h.GetPorts().GetNumbers()[0] != 8080 {
 		t.Errorf("http rule = %v, want the host on port 8080", rules[1])
 	}
-	if p := rules[2].GetTlsPassthrough(); p == nil || len(p.GetHostnames()) != 2 || p.GetPorts().GetNumbers()[0] != 443 {
-		t.Errorf("tls rule = %v, want two hosts on port 443 by default", rules[2])
+	for i, host := range []string{"github.com", "*.github.com"} {
+		if p := rules[2+i].GetTlsPassthrough(); p == nil || len(p.GetHostnames()) != 1 || p.GetHostnames()[0] != host || p.GetPorts().GetNumbers()[0] != 443 {
+			t.Errorf("tls rule = %v, want %s on port 443 by default", rules[2+i], host)
+		}
 	}
 	// The policy exists before the actor first runs.
 	want := []string{"create net-task", "egress net-task", "resume net-task"}
@@ -453,10 +456,8 @@ func TestTaskReconciler_EgressPolicyError(t *testing.T) {
 				ApiVersion: v1alpha1.APIVersion,
 				Kind:       v1alpha1.KindTask,
 				Metadata:   &v1alpha1.ObjectMeta{Name: "net-task", Atespace: "default"},
-				Spec: &v1alpha1.TaskSpec{Image: "ghcr.io/my-org/my-image", Egress: &v1alpha1.EgressSpec{Rules: []*v1alpha1.EgressRule{
-					{Https: &v1alpha1.EgressHosts{Hostnames: []string{"example.com"}}},
-				}}},
-				Status: &v1alpha1.TaskStatus{Phase: "Running"},
+				Spec:       &v1alpha1.TaskSpec{Image: "ghcr.io/my-org/my-image", Egress: &v1alpha1.EgressSpec{Hosts: []string{"https://example.com"}}},
+				Status:     &v1alpha1.TaskStatus{Phase: "Running"},
 			}
 			reconciled, err := reconciler.Reconcile(ctx, task)
 			if err == nil {

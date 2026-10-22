@@ -201,10 +201,14 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 	// Give the actor its egress policy before it first runs. Substrate
 	// denies every connection of an actor without one, so a task that names
-	// no egress has no network access. Tasks are immutable, and the policy is
-	// created once.
-	if egress := task.Spec.GetEgress(); egress != nil {
-		if err := r.client.EnsureActorEgressPolicy(ctx, atespace, actorName, egressRules(egress)); err != nil {
+	// no egress hosts has no network access. Tasks are immutable, and the
+	// policy is created once.
+	if egress := task.Spec.GetEgress(); len(egress.GetHosts()) > 0 {
+		rules, err := egressRules(egress)
+		if err == nil {
+			err = r.client.EnsureActorEgressPolicy(ctx, atespace, actorName, rules)
+		}
+		if err != nil {
 			if substrate.IsTransientError(err) {
 				r.setNotReady(task, "SubstrateUnavailable", err.Error(), now)
 				task.Status.Phase = "Pending"

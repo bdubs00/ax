@@ -282,47 +282,112 @@ func ValidateObjectMeta(meta *ObjectMeta) error {
 	return nil
 }
 
-// hostnameRegexp matches an egress hostname pattern: a lowercase DNS name of
-// labels separated by dots, with "*" allowed as the whole leftmost label.
-var hostnameRegexp = regexp.MustCompile(`^(\*|[a-z0-9]([-a-z0-9]*[a-z0-9])?)(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+// Protocols of an egress host, as ParseEgressHost reports them.
+const (
+	// EgressTLS is TLS that the egress gateway forwards without decryption,
+	// for any protocol carried over TLS. It is the protocol of a host without
+	// a scheme.
+	EgressTLS = "tls"
+	// EgressHTTP is cleartext HTTP, including h2c. It is the protocol of a
+	// host with the scheme "http://".
+	EgressHTTP = "http"
+	// EgressHTTPS is HTTPS that the egress gateway intercepts, so it can act
+	// on each request. It is the protocol of a host with the scheme
+	// "https://".
+	EgressHTTPS = "https"
+)
 
-// validateEgress reports the first problem with spec.egress: a rule must set
-// exactly one protocol, name at least one hostname in the pattern syntax of
-// the egress gateway, and give ports between 1 and 65535 without repeats. A
-// nil spec is fine; the task then has no network access.
-func validateEgress(e *EgressSpec) error {
-	for i, r := range e.GetRules() {
-		field := fmt.Sprintf("spec.egress.rules[%d]", i)
-		var hosts *EgressHosts
-		n := 0
-		for name, h := range map[string]*EgressHosts{"http": r.GetHttp(), "https": r.GetHttps(), "tls": r.GetTls()} {
-			if h != nil {
-				n++
-				hosts = h
-				field += "." + name
-			}
+// Default ports of the egress protocols, for a host that names none.
+var egressDefaultPorts = map[string]int32{EgressTLS: 443, EgressHTTP: 80, EgressHTTPS: 443}
+
+// EgressHost is one entry of spec.egress.hosts, parsed.
+type EgressHost struct {
+	// Protocol is EgressTLS, EgressHTTP, or EgressHTTPS.
+	Protocol string
+	// Host is a lowercase DNS name, or a DNS name with "*" as its leftmost
+	// label.
+	Host string
+	// Port is the destination port.
+	Port int32
+}
+
+var (
+	hostLabel     = `[a-z0-9]([-a-z0-9]*[a-z0-9])?`
+	hostRegexp    = regexp.MustCompile(`^` + hostLabel + `(\.` + hostLabel + `)*$`)
+	maxHostLength = 253
+)
+
+// validateHost reports whether h is a lowercase DNS name, optionally with "*"
+// as its leftmost label when wildcard is true.
+func validateHost(h string, wildcard bool) error {
+	name := h
+	if wildcard {
+		name = strings.TrimPrefix(h, "*.")
+	}
+	if len(name) == 0 || len(name) > maxHostLength || !hostRegexp.MatchString(name) {
+		if wildcard {
+			return fmt.Errorf("%q must be a lowercase DNS name, optionally starting with \"*.\"", h)
 		}
-		if n != 1 {
-			return fmt.Errorf("spec.egress.rules[%d]: exactly one of http, https, and tls is required", i)
+		return fmt.Errorf("%q must be a lowercase DNS name", h)
+	}
+	return nil
+}
+
+// ParseEgressHost reads one entry of spec.egress.hosts: a DNS name with an
+// optional scheme and an optional port, "[http://|https://]host[:port]". A
+// name without a scheme is TLS on port 443, forwarded without decryption.
+// "http://" is cleartext HTTP on port 80, and "https://" is HTTPS on port 443
+// that the egress gateway intercepts. A port replaces the default of the
+// protocol. The name may start with "*." to match one label.
+func ParseEgressHost(s string) (EgressHost, error) {
+	e := EgressHost{Protocol: EgressTLS}
+	rest := s
+	if scheme, after, ok := strings.Cut(s, "://"); ok {
+		switch scheme {
+		case "http":
+			e.Protocol = EgressHTTP
+		case "https":
+			e.Protocol = EgressHTTPS
+		default:
+			return EgressHost{}, fmt.Errorf("%q: the scheme must be http or https, or absent for TLS", s)
 		}
-		if len(hosts.GetHostnames()) == 0 {
-			return fmt.Errorf("%s: at least one hostname is required", field)
+		rest = after
+	}
+	if strings.ContainsAny(rest, "/?#@") {
+		return EgressHost{}, fmt.Errorf("%q must be a host with an optional scheme and port, not a URL with a path", s)
+	}
+	host, port, hasPort := strings.Cut(rest, ":")
+	if err := validateHost(host, true); err != nil {
+		return EgressHost{}, err
+	}
+	e.Host = host
+	e.Port = egressDefaultPorts[e.Protocol]
+	if hasPort {
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || n == 0 {
+			return EgressHost{}, fmt.Errorf("%q: port %q is not between 1 and 65535", s, port)
 		}
-		for _, h := range hosts.GetHostnames() {
-			if len(h) > 253 || !hostnameRegexp.MatchString(h) || strings.Contains(h[1:], "*") {
-				return fmt.Errorf("%s: hostname %q must be a lowercase DNS name without a trailing dot, with \"*\" only as its leftmost label", field, h)
-			}
+		e.Port = int32(n)
+	}
+	return e, nil
+}
+
+// validateEgress reports the first problem with spec.egress.hosts: an entry
+// that ParseEgressHost refuses, or two entries that name the same host and
+// port, which Substrate refuses in one policy. A task without egress is fine;
+// it then has no network access.
+func validateEgress(spec *TaskSpec) error {
+	seen := map[string]int{}
+	for i, h := range spec.GetEgress().GetHosts() {
+		e, err := ParseEgressHost(h)
+		if err != nil {
+			return fmt.Errorf("spec.egress.hosts[%d]: %w", i, err)
 		}
-		seen := make(map[int32]bool, len(hosts.GetPorts()))
-		for _, port := range hosts.GetPorts() {
-			if port < 1 || port > 65535 {
-				return fmt.Errorf("%s: port %d is not between 1 and 65535", field, port)
-			}
-			if seen[port] {
-				return fmt.Errorf("%s: port %d is listed twice", field, port)
-			}
-			seen[port] = true
+		k := fmt.Sprintf("%s:%d", e.Host, e.Port)
+		if j, dup := seen[k]; dup {
+			return fmt.Errorf("spec.egress.hosts[%d]: %q names %s again, as spec.egress.hosts[%d] does", i, h, k, j)
 		}
+		seen[k] = i
 	}
 	return nil
 }
@@ -385,8 +450,5 @@ func ValidateTask(t *Task) error {
 		}
 		seen[p] = r.GetName()
 	}
-	if err := validateEgress(spec.GetEgress()); err != nil {
-		return err
-	}
-	return nil
+	return validateEgress(spec)
 }

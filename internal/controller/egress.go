@@ -15,48 +15,34 @@
 package controller
 
 import (
+	"fmt"
+
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 )
 
-// Default ports of the egress protocols, when a rule names none.
-const (
-	defaultHTTPPort  = 80
-	defaultHTTPSPort = 443
-	defaultTLSPort   = 443
-)
-
-// egressRules turns the egress section of a task into the rules of its
-// actor's egress policy on Substrate. A rule without ports gets the default
-// port of its protocol. The API server validated the section when the task
-// was created, so every rule names one protocol and at least one hostname.
-func egressRules(spec *v1alpha1.EgressSpec) []*ateapipb.EgressRule {
-	rules := make([]*ateapipb.EgressRule, 0, len(spec.GetRules()))
-	for _, r := range spec.GetRules() {
-		switch {
-		case r.GetHttp() != nil:
-			rules = append(rules, &ateapipb.EgressRule{Http: &ateapipb.HTTPRule{
-				Hostnames: r.GetHttp().GetHostnames(), Ports: egressPorts(r.GetHttp(), defaultHTTPPort),
-			}})
-		case r.GetHttps() != nil:
-			rules = append(rules, &ateapipb.EgressRule{Https: &ateapipb.HTTPSRule{
-				Hostnames: r.GetHttps().GetHostnames(), Ports: egressPorts(r.GetHttps(), defaultHTTPSPort),
-			}})
-		case r.GetTls() != nil:
-			rules = append(rules, &ateapipb.EgressRule{TlsPassthrough: &ateapipb.TLSPassthroughRule{
-				Hostnames: r.GetTls().GetHostnames(), Ports: egressPorts(r.GetTls(), defaultTLSPort),
-			}})
+// egressRules turns spec.egress.hosts of a task into the rules of its actor's
+// egress policy on Substrate, one rule per host: a host without a scheme is a
+// TLS passthrough rule, "http://" an HTTP rule, and "https://" an HTTPS rule,
+// each on the port of the host. The API server validated the hosts when the
+// task was created, so a host that does not parse here is an error of the
+// stored task, and the caller fails the task with it.
+func egressRules(spec *v1alpha1.EgressSpec) ([]*ateapipb.EgressRule, error) {
+	rules := make([]*ateapipb.EgressRule, 0, len(spec.GetHosts()))
+	for i, h := range spec.GetHosts() {
+		e, err := v1alpha1.ParseEgressHost(h)
+		if err != nil {
+			return nil, fmt.Errorf("spec.egress.hosts[%d]: %w", i, err)
+		}
+		hosts, ports := []string{e.Host}, &ateapipb.Ports{Numbers: []int32{e.Port}}
+		switch e.Protocol {
+		case v1alpha1.EgressHTTP:
+			rules = append(rules, &ateapipb.EgressRule{Http: &ateapipb.HTTPRule{Hostnames: hosts, Ports: ports}})
+		case v1alpha1.EgressHTTPS:
+			rules = append(rules, &ateapipb.EgressRule{Https: &ateapipb.HTTPSRule{Hostnames: hosts, Ports: ports}})
+		default:
+			rules = append(rules, &ateapipb.EgressRule{TlsPassthrough: &ateapipb.TLSPassthroughRule{Hostnames: hosts, Ports: ports}})
 		}
 	}
-	return rules
-}
-
-// egressPorts selects the ports of a rule, or the default port of its
-// protocol when the rule names none.
-func egressPorts(h *v1alpha1.EgressHosts, def int32) *ateapipb.Ports {
-	ports := h.GetPorts()
-	if len(ports) == 0 {
-		ports = []int32{def}
-	}
-	return &ateapipb.Ports{Numbers: ports}
+	return rules, nil
 }

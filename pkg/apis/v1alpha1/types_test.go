@@ -597,14 +597,11 @@ func TestValidateWorkspace_Files(t *testing.T) {
 }
 
 func TestValidateTask_Egress(t *testing.T) {
-	task := func(rules ...*v1alpha1.EgressRule) *v1alpha1.Task {
+	task := func(hosts ...string) *v1alpha1.Task {
 		return &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "t", Atespace: "default"},
-			Spec:     &v1alpha1.TaskSpec{Egress: &v1alpha1.EgressSpec{Rules: rules}},
+			Spec:     &v1alpha1.TaskSpec{Egress: &v1alpha1.EgressSpec{Hosts: hosts}},
 		}
-	}
-	hosts := func(ports ...int32) *v1alpha1.EgressHosts {
-		return &v1alpha1.EgressHosts{Hostnames: []string{"api.example.com", "*.googleapis.com", "*"}, Ports: ports}
 	}
 	cases := []struct {
 		name string
@@ -613,17 +610,20 @@ func TestValidateTask_Egress(t *testing.T) {
 	}{
 		{"no egress", &v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: "t"}, Spec: &v1alpha1.TaskSpec{}}, ""},
 		{"empty egress", task(), ""},
-		{"http https tls", task(&v1alpha1.EgressRule{Http: hosts()}, &v1alpha1.EgressRule{Https: hosts(443, 8443)}, &v1alpha1.EgressRule{Tls: hosts(443)}), ""},
-		{"no protocol", task(&v1alpha1.EgressRule{}), "exactly one of http, https, and tls"},
-		{"two protocols", task(&v1alpha1.EgressRule{Http: hosts(), Https: hosts()}), "exactly one of http, https, and tls"},
-		{"no hostname", task(&v1alpha1.EgressRule{Https: &v1alpha1.EgressHosts{}}), "at least one hostname"},
-		{"uppercase hostname", task(&v1alpha1.EgressRule{Https: &v1alpha1.EgressHosts{Hostnames: []string{"API.example.com"}}}), `hostname "API.example.com"`},
-		{"trailing dot", task(&v1alpha1.EgressRule{Https: &v1alpha1.EgressHosts{Hostnames: []string{"example.com."}}}), `hostname "example.com."`},
-		{"wildcard inside", task(&v1alpha1.EgressRule{Https: &v1alpha1.EgressHosts{Hostnames: []string{"api.*.example.com"}}}), `hostname "api.*.example.com"`},
-		{"url", task(&v1alpha1.EgressRule{Https: &v1alpha1.EgressHosts{Hostnames: []string{"https://example.com"}}}), `hostname "https://example.com"`},
-		{"port zero", task(&v1alpha1.EgressRule{Http: hosts(0)}), "port 0 is not between"},
-		{"port too large", task(&v1alpha1.EgressRule{Http: hosts(70000)}), "port 70000 is not between"},
-		{"port twice", task(&v1alpha1.EgressRule{Http: hosts(80, 80)}), "port 80 is listed twice"},
+		{"hosts", task("api.example.com", "*.googleapis.com", "github.com:8443", "http://nats.agents.svc.cluster.local:8080", "http://model.models.svc.cluster.local", "https://api.example.com:8443"), ""},
+		{"one host on two ports", task("example.com", "http://example.com"), ""},
+		{"uppercase", task("API.example.com"), `spec.egress.hosts[0]: "API.example.com" must be a lowercase DNS name`},
+		{"trailing dot", task("example.com."), `"example.com." must be`},
+		{"wildcard inside", task("api.*.example.com"), `"api.*.example.com" must be`},
+		{"wildcard alone", task("*"), `"*" must be`},
+		{"empty", task(""), `"" must be`},
+		{"scheme", task("ftp://example.com"), "the scheme must be http or https"},
+		{"path", task("https://example.com/v1"), "not a URL with a path"},
+		{"userinfo", task("user@example.com"), "not a URL with a path"},
+		{"port zero", task("example.com:0"), `port "0" is not between 1 and 65535`},
+		{"port too large", task("example.com:70000"), `port "70000" is not between`},
+		{"port not a number", task("example.com:http"), `port "http" is not between`},
+		{"host twice", task("example.com", "example.com:443"), `spec.egress.hosts[1]: "example.com:443" names example.com:443 again, as spec.egress.hosts[0] does`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -635,5 +635,23 @@ func TestValidateTask_Egress(t *testing.T) {
 				t.Fatalf("ValidateTask = %v, want an error with %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestParseEgressHost(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want v1alpha1.EgressHost
+	}{
+		{"api.example.com", v1alpha1.EgressHost{Protocol: v1alpha1.EgressTLS, Host: "api.example.com", Port: 443}},
+		{"*.github.com:8443", v1alpha1.EgressHost{Protocol: v1alpha1.EgressTLS, Host: "*.github.com", Port: 8443}},
+		{"http://nats.agents.svc.cluster.local", v1alpha1.EgressHost{Protocol: v1alpha1.EgressHTTP, Host: "nats.agents.svc.cluster.local", Port: 80}},
+		{"http://nats.agents.svc.cluster.local:8080", v1alpha1.EgressHost{Protocol: v1alpha1.EgressHTTP, Host: "nats.agents.svc.cluster.local", Port: 8080}},
+		{"https://api.example.com", v1alpha1.EgressHost{Protocol: v1alpha1.EgressHTTPS, Host: "api.example.com", Port: 443}},
+	} {
+		got, err := v1alpha1.ParseEgressHost(tc.in)
+		if err != nil || got != tc.want {
+			t.Errorf("ParseEgressHost(%q) = %+v, %v; want %+v", tc.in, got, err, tc.want)
+		}
 	}
 }
