@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,6 +47,8 @@ func main() {
 		substratePlaintext      bool
 		defaultTemplate         string
 		defaultTemplateAtespace string
+		taskCapabilitiesAdd     string
+		taskCapabilitiesDrop    string
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
@@ -59,7 +62,15 @@ func main() {
 	flag.BoolVar(&substratePlaintext, "substrate-plaintext", false, "Use insecure plaintext gRPC connection to Substrate")
 	flag.StringVar(&defaultTemplate, "template", "default-template", "Default Substrate ActorTemplate name")
 	flag.StringVar(&defaultTemplateAtespace, "template-atespace", v1alpha1.DefaultSystemNamespace, "Default Substrate ActorTemplate atespace")
+	flag.StringVar(&taskCapabilitiesAdd, "task-capabilities-add", "", "Comma-separated Linux capabilities, without the CAP_ prefix, granted to the container of every task on top of Substrate's default set (AUDIT_WRITE, KILL, NET_BIND_SERVICE), such as CHOWN,SETUID")
+	flag.StringVar(&taskCapabilitiesDrop, "task-capabilities-drop", "", "Comma-separated Linux capabilities removed from the default set of the container of every task; ALL removes the whole set")
 	flag.Parse()
+
+	securityContext, err := substrate.TaskSecurityContext(splitList(taskCapabilitiesAdd), splitList(taskCapabilitiesDrop))
+	if err != nil {
+		slog.Error("invalid task capabilities", "error", err)
+		os.Exit(2)
+	}
 
 	if envAddr := os.Getenv("ADDR"); envAddr != "" {
 		listenAddr = envAddr
@@ -79,6 +90,8 @@ func main() {
 		"redisAddr", redisAddr,
 		"substrateEndpoint", substrateEndpoint,
 		"template", defaultTemplate,
+		"taskCapabilitiesAdd", securityContext.GetCapabilities().GetAdd(),
+		"taskCapabilitiesDrop", securityContext.GetCapabilities().GetDrop(),
 	)
 
 	rClient := goredis.NewClient(&goredis.Options{
@@ -103,7 +116,9 @@ func main() {
 		slog.Warn("could not initialize substrate client; running without substrate reconciliation", "error", err)
 	} else {
 		defer subClient.Close()
-		reconciler = controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace)
+		taskReconciler := controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace)
+		taskReconciler.SecurityContext = securityContext
+		reconciler = taskReconciler
 	}
 
 	srv := server.NewServer(rStore, server.Options{
@@ -135,4 +150,15 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+}
+
+// splitList splits a comma-separated flag value into its trimmed, non-empty items.
+func splitList(s string) []string {
+	var out []string
+	for _, item := range strings.Split(s, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }

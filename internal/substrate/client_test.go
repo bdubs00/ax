@@ -17,6 +17,7 @@ package substrate
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -203,7 +204,7 @@ func TestClient_DeleteActor_PropagatesRPCError(t *testing.T) {
 func TestBuildActorTemplate(t *testing.T) {
 	t.Setenv("AX_SNAPSHOTS_BUCKET", "gs://ate-snapshots/ax/")
 
-	tmpl := BuildActorTemplate("", "test-tmpl", "", map[string]string{"FOO": "BAR"}, nil, "")
+	tmpl := BuildActorTemplate("", "test-tmpl", "", map[string]string{"FOO": "BAR"}, nil, "", nil)
 	if tmpl.GetMetadata().GetAtespace() != "default" {
 		t.Errorf("expected default atespace, got %q", tmpl.GetMetadata().GetAtespace())
 	}
@@ -227,6 +228,59 @@ func TestBuildActorTemplate(t *testing.T) {
 	}
 	if snapCfg.GetPreferredFidelity() != ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES {
 		t.Errorf("expected PreferredFidelity VOLUMES, got %v", snapCfg.GetPreferredFidelity())
+	}
+	if container.GetSecurityContext() != nil {
+		t.Errorf("expected no security context, got %v", container.GetSecurityContext())
+	}
+}
+
+func TestBuildActorTemplate_SecurityContext(t *testing.T) {
+	sc, err := TaskSecurityContext([]string{"CHOWN", "SETUID"}, []string{"NET_BIND_SERVICE"})
+	if err != nil {
+		t.Fatalf("TaskSecurityContext: %v", err)
+	}
+	tmpl := BuildActorTemplate("", "test-tmpl", "", nil, nil, "gs://bucket/", sc)
+	caps := tmpl.GetContainers()[0].GetSecurityContext().GetCapabilities()
+	if strings.Join(caps.GetAdd(), ",") != "CHOWN,SETUID" || strings.Join(caps.GetDrop(), ",") != "NET_BIND_SERVICE" {
+		t.Errorf("unexpected capabilities: %v", caps)
+	}
+}
+
+func TestTaskSecurityContext(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		add, drop []string
+		wantNil   bool
+		wantErr   string
+	}{
+		{name: "empty", wantNil: true},
+		{name: "add", add: []string{"CHOWN", "DAC_OVERRIDE", "SETGID", "SETUID"}},
+		{name: "drop all, add one", add: []string{"SETUID"}, drop: []string{"ALL"}},
+		{name: "prefix", add: []string{"CAP_SETUID"}, wantErr: "without the CAP_ prefix"},
+		{name: "all in add", add: []string{"ALL"}, wantErr: "ALL is not accepted"},
+		{name: "lowercase", add: []string{"setuid"}, wantErr: "not an uppercase capability name"},
+		{name: "twice", drop: []string{"KILL", "KILL"}, wantErr: "named twice"},
+		{name: "too long", add: []string{strings.Repeat("A", 64)}, wantErr: "not an uppercase capability name"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sc, err := TaskSecurityContext(tc.add, tc.drop)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("expected an error with %q, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if (sc == nil) != tc.wantNil {
+				t.Fatalf("expected nil %v, got %v", tc.wantNil, sc)
+			}
+			if sc != nil && (strings.Join(sc.GetCapabilities().GetAdd(), ",") != strings.Join(tc.add, ",") ||
+				strings.Join(sc.GetCapabilities().GetDrop(), ",") != strings.Join(tc.drop, ",")) {
+				t.Errorf("unexpected capabilities: %v", sc.GetCapabilities())
+			}
+		})
 	}
 }
 
@@ -312,6 +366,7 @@ func TestClient_EnsureActorTemplateWithImage_Success(t *testing.T) {
 		"default",
 		"task-1-tmpl-abcd",
 		"custom-image:v1",
+		nil,
 		map[string]string{"FOO": "BAR"},
 	)
 	if err != nil {
@@ -346,6 +401,7 @@ func TestClient_EnsureActorTemplateWithImage_PropagatesError(t *testing.T) {
 		"default",
 		"task-1-tmpl-abcd",
 		"custom-image:v1",
+		nil,
 	)
 	if err == nil {
 		t.Fatal("expected error, got nil")

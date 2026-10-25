@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -290,8 +291,60 @@ func retryOnCodes(ctx context.Context, fn func() error, retryable ...codes.Code)
 	return err
 }
 
+// capabilityName is the grammar Substrate accepts for a Linux capability:
+// uppercase and without the "CAP_" prefix, which Substrate adds itself.
+var capabilityName = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+
+// maxCapabilityNameLength is the longest capability name Substrate accepts.
+const maxCapabilityNameLength = 63
+
+// TaskSecurityContext builds the security context of the guest container of
+// a task. add grants capabilities on top of Substrate's default set
+// (AUDIT_WRITE, KILL, and NET_BIND_SERVICE), and drop removes capabilities
+// from that set; "ALL" in drop removes the whole set. Substrate applies drop
+// first, then add. Names are written without the "CAP_" prefix, such as
+// "SETUID". It returns nil when both lists are empty, which leaves the
+// default set, and an error for a name Substrate would refuse.
+func TaskSecurityContext(add, drop []string) (*ateapipb.SecurityContext, error) {
+	if len(add) == 0 && len(drop) == 0 {
+		return nil, nil
+	}
+	check := func(list string, names []string, allowAll bool) error {
+		seen := make(map[string]bool, len(names))
+		for _, c := range names {
+			switch {
+			case c == "ALL" && allowAll:
+			case c == "ALL":
+				return fmt.Errorf("%s: ALL is not accepted; name each capability the task needs", list)
+			case strings.HasPrefix(c, "CAP_"):
+				return fmt.Errorf("%s: %q must be named without the CAP_ prefix, such as %q", list, c, strings.TrimPrefix(c, "CAP_"))
+			case len(c) > maxCapabilityNameLength || !capabilityName.MatchString(c):
+				return fmt.Errorf("%s: %q is not an uppercase capability name such as SETUID", list, c)
+			}
+			if seen[c] {
+				return fmt.Errorf("%s: %q is named twice", list, c)
+			}
+			seen[c] = true
+		}
+		return nil
+	}
+	if err := check("add", add, false); err != nil {
+		return nil, err
+	}
+	if err := check("drop", drop, true); err != nil {
+		return nil, err
+	}
+	return &ateapipb.SecurityContext{
+		Capabilities: &ateapipb.Capabilities{
+			Add:  slices.Clone(add),
+			Drop: slices.Clone(drop),
+		},
+	}, nil
+}
+
 // BuildActorTemplate constructs a Substrate ActorTemplate based on the standard ate-env specification.
-func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket string) *ateapipb.ActorTemplate {
+// A nil securityContext leaves the guest container with Substrate's default capabilities.
+func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket string, securityContext *ateapipb.SecurityContext) *ateapipb.ActorTemplate {
 	if atespace == "" {
 		atespace = "default"
 	}
@@ -337,6 +390,7 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 				Name:      "workspace",
 				MountPath: "/workspace",
 			}},
+			SecurityContext: securityContext,
 		}},
 		Volumes: []*ateapipb.Volume{{
 			Name:       "workspace",
@@ -353,8 +407,9 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 	}
 }
 
-// EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image and optional environment variables.
-func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image string, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
+// EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image,
+// security context (nil for Substrate's default capabilities), and optional environment variables.
+func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image string, securityContext *ateapipb.SecurityContext, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
 	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
 	if err == nil && existing != nil {
 		return existing, nil
@@ -367,7 +422,7 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 		}
 	}
 
-	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "")
+	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", securityContext)
 	req := &ateapipb.CreateActorTemplateRequest{
 		ActorTemplate: tmpl,
 	}

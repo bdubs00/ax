@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/ax/internal/model"
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
@@ -71,6 +72,14 @@ type TaskReconciler struct {
 	// WorkspaceReadyTimeout bounds how long Reconcile waits for the actor's workspace
 	// to report ready before recording it as still initializing.
 	WorkspaceReadyTimeout time.Duration
+
+	// SecurityContext is the security context of the guest container of every
+	// task, from the server's --task-capabilities-add and --task-capabilities-drop
+	// flags. Nil leaves Substrate's default capability set. Like the snapshots
+	// bucket, it is a setting of the server and not part of the template digest:
+	// a change reaches the templates provisioned after it, and an existing task
+	// keeps its template and actor.
+	SecurityContext *ateapipb.SecurityContext
 }
 
 // NewTaskReconciler creates a new TaskReconciler.
@@ -177,7 +186,19 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image)
 		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, extraEnv)
 
-		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, extraEnv)
+		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, r.SecurityContext, extraEnv)
+		if err != nil && r.SecurityContext != nil {
+			// The default template does not carry the server's capabilities, so
+			// falling back would run the task with other capabilities than configured.
+			if substrate.IsTransientError(err) {
+				r.setNotReady(task, "SubstrateUnavailable", err.Error(), now)
+				task.Status.Phase = "Pending"
+				return task, fmt.Errorf("ensuring actor template: %w", err)
+			}
+			r.setNotReady(task, "TemplateCreationFailed", err.Error(), now)
+			task.Status.Phase = "Failed"
+			return task, fmt.Errorf("ensuring actor template: %w", err)
+		}
 		if err != nil {
 			slog.Warn("could not create custom ActorTemplate, falling back to default template", "error", err)
 		} else if tmpl != nil && tmpl.Metadata != nil {

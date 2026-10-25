@@ -43,6 +43,8 @@ type mockControlServer struct {
 	suspendErr        error
 	deletedActors     []string
 	actorTemplates    map[string]bool
+	createdTemplates  []*ateapipb.ActorTemplate
+	createTemplateErr error
 	deletedTemplates  []string
 	getActorFunc      func(ctx context.Context, req *ateapipb.GetActorRequest) (*ateapipb.Actor, error)
 	createAtespaceErr error
@@ -69,11 +71,15 @@ func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.Ge
 }
 
 func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb.CreateActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+	if m.createTemplateErr != nil {
+		return nil, m.createTemplateErr
+	}
 	if m.actorTemplates == nil {
 		m.actorTemplates = make(map[string]bool)
 	}
 	tmpl := req.GetActorTemplate()
 	m.actorTemplates[tmpl.GetMetadata().GetName()] = true
+	m.createdTemplates = append(m.createdTemplates, tmpl)
 	return tmpl, nil
 }
 
@@ -997,4 +1003,142 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 		t.Errorf("expected Phase='Failed' on permanent error, got %q", reconciled4.GetStatus().GetPhase())
 	}
 	mockSrv.createActorErr = nil
+}
+
+// startMockSubstrate serves mockSrv over gRPC on a loopback port and returns a
+// reconciler connected to it.
+func startMockSubstrate(t *testing.T, mockSrv *mockControlServer) *controller.TaskReconciler {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	t.Cleanup(func() { lis.Close() })
+	grpcServer := grpc.NewServer()
+	ateapipb.RegisterControlServer(grpcServer, mockSrv)
+	go grpcServer.Serve(lis)
+	t.Cleanup(grpcServer.Stop)
+	client, err := substrate.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("failed to create substrate client: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace)
+	reconciler.SecretResolver = noSecrets
+	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+	return reconciler
+}
+
+// The server's capabilities reach the guest container of the task's template,
+// and they do not change the template's name: a server setting is not part of
+// the digest, so an existing task keeps its template.
+func TestTaskReconciler_SecurityContext(t *testing.T) {
+	ctx := context.Background()
+	newTask := func() *v1alpha1.Task {
+		return &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "caps-task", Atespace: "default"},
+			Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/my-org/my-image"},
+		}
+	}
+
+	plainSrv := &mockControlServer{}
+	if _, err := startMockSubstrate(t, plainSrv).Reconcile(ctx, newTask()); err != nil {
+		t.Fatalf("Reconcile without capabilities failed: %v", err)
+	}
+	if len(plainSrv.createdTemplates) != 1 {
+		t.Fatalf("expected 1 template, got %d", len(plainSrv.createdTemplates))
+	}
+	if sc := plainSrv.createdTemplates[0].GetContainers()[0].GetSecurityContext(); sc != nil {
+		t.Errorf("expected no security context without the flags, got %v", sc)
+	}
+
+	sc, err := substrate.TaskSecurityContext([]string{"CHOWN", "DAC_OVERRIDE", "SETGID", "SETUID"}, nil)
+	if err != nil {
+		t.Fatalf("TaskSecurityContext: %v", err)
+	}
+	capsSrv := &mockControlServer{}
+	reconciler := startMockSubstrate(t, capsSrv)
+	reconciler.SecurityContext = sc
+	reconciled, err := reconciler.Reconcile(ctx, newTask())
+	if err != nil {
+		t.Fatalf("Reconcile with capabilities failed: %v", err)
+	}
+	if reconciled.GetStatus().GetPhase() != "Suspended" {
+		t.Errorf("expected phase Suspended, got %q", reconciled.GetStatus().GetPhase())
+	}
+	if len(capsSrv.createdTemplates) != 1 {
+		t.Fatalf("expected 1 template, got %d", len(capsSrv.createdTemplates))
+	}
+	tmpl := capsSrv.createdTemplates[0]
+	got := tmpl.GetContainers()[0].GetSecurityContext().GetCapabilities().GetAdd()
+	if strings.Join(got, ",") != "CHOWN,DAC_OVERRIDE,SETGID,SETUID" {
+		t.Errorf("expected the server's capabilities in the template, got %v", got)
+	}
+	if tmpl.GetMetadata().GetName() != plainSrv.createdTemplates[0].GetMetadata().GetName() {
+		t.Errorf("capabilities changed the template name: %q, without them %q", tmpl.GetMetadata().GetName(), plainSrv.createdTemplates[0].GetMetadata().GetName())
+	}
+}
+
+// With capabilities configured, a template that Substrate refuses fails the
+// task instead of falling back to the default template, which does not carry
+// them. A transient error leaves the task pending.
+func TestTaskReconciler_SecurityContextTemplateError(t *testing.T) {
+	ctx := context.Background()
+	sc, err := substrate.TaskSecurityContext([]string{"SETUID"}, nil)
+	if err != nil {
+		t.Fatalf("TaskSecurityContext: %v", err)
+	}
+
+	mockSrv := &mockControlServer{createTemplateErr: status.Error(codes.InvalidArgument, "capabilities.add[0]: invalid")}
+	reconciler := startMockSubstrate(t, mockSrv)
+	reconciler.SecurityContext = sc
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "caps-refused", Atespace: "default"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/my-org/my-image"},
+	}
+	reconciled, err := reconciler.Reconcile(ctx, task)
+	if err == nil {
+		t.Fatal("expected an error when the template is refused, got nil")
+	}
+	if reconciled.GetStatus().GetPhase() != "Failed" {
+		t.Errorf("expected phase Failed, got %q", reconciled.GetStatus().GetPhase())
+	}
+	assertCondition(t, reconciled, "Ready", "False", "TemplateCreationFailed")
+	if len(mockSrv.createdActors) != 0 {
+		t.Errorf("expected no actor on the default template, got %v", mockSrv.createdActors)
+	}
+
+	mockSrv.createTemplateErr = status.Error(codes.DeadlineExceeded, "substrate is slow")
+	task = &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "caps-transient", Atespace: "default"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/my-org/my-image"},
+	}
+	reconciled, err = reconciler.Reconcile(ctx, task)
+	if err == nil {
+		t.Fatal("expected an error on a transient template error, got nil")
+	}
+	if reconciled.GetStatus().GetPhase() != "Pending" {
+		t.Errorf("expected phase Pending, got %q", reconciled.GetStatus().GetPhase())
+	}
+	assertCondition(t, reconciled, "Ready", "False", "SubstrateUnavailable")
+	if len(mockSrv.createdActors) != 0 {
+		t.Errorf("expected no actor on the default template, got %v", mockSrv.createdActors)
+	}
+}
+
+// Without capabilities configured, a refused template still falls back to the
+// default template, as before.
+func TestTaskReconciler_TemplateErrorFallsBackWithoutSecurityContext(t *testing.T) {
+	mockSrv := &mockControlServer{createTemplateErr: status.Error(codes.InvalidArgument, "invalid template")}
+	reconciler := startMockSubstrate(t, mockSrv)
+	task := &v1alpha1.Task{
+		Metadata: &v1alpha1.ObjectMeta{Name: "fallback", Atespace: "default"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghcr.io/my-org/my-image"},
+	}
+	if _, err := reconciler.Reconcile(context.Background(), task); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if len(mockSrv.createdActors) != 1 || mockSrv.createdActors[0] != "fallback" {
+		t.Errorf("expected the actor on the default template, got %v", mockSrv.createdActors)
+	}
 }

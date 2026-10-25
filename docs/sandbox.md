@@ -44,3 +44,16 @@ When a task sets `spec.debug: true`, port 80 also serves the [Agent Substrate gu
 | Variable | Value |
 |---|---|
 | `AX_METADATA_URL` | Base URL of the metadata server, `http://127.0.0.1:8099` by default |
+
+## Capabilities
+
+The task container's processes run with Agent Substrate's default set of Linux capabilities: `AUDIT_WRITE`, `KILL`, and `NET_BIND_SERVICE`. Root inside the sandbox can therefore not change the owner of a file or start a process as another user, so a command that wants to run untrusted tools as an unprivileged user cannot.
+
+An operator can change the set for every task with two `ax-server` flags. Names are written without the `CAP_` prefix:
+
+| Flag | Effect |
+|---|---|
+| `--task-capabilities-add` | Comma-separated capabilities granted on top of the default set, such as `CHOWN,DAC_OVERRIDE,SETGID,SETUID`. `ALL` is refused. |
+| `--task-capabilities-drop` | Comma-separated capabilities removed from the default set. `ALL` removes the whole set, so `--task-capabilities-drop=ALL` with `--task-capabilities-add` gives an exact set. |
+
+The server puts them in the `securityContext.capabilities` of the guest container of each task's ActorTemplate, and Substrate applies `drop` first, then `add`. The capabilities apply inside the gVisor sandbox, which stays the boundary between the task and the node. The flags are a setting of the server, not part of a task: a change reaches the templates of tasks created after it, and an existing task keeps its template. While the flags are set, a task whose template Substrate refuses fails with `TemplateCreationFailed` instead of falling back to the default template, which does not carry the capabilities.
