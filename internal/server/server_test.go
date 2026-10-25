@@ -308,6 +308,30 @@ func TestCreateTask_ValidatesWorkspaceBindings(t *testing.T) {
 	}
 }
 
+// A secretRef that names a store other than the default one is refused until
+// the SecretStore resource lands; the default store is accepted.
+func TestCreateTask_SecretRefStore(t *testing.T) {
+	srv := server.NewServer(memory.NewStore())
+	ctx := context.Background()
+	task := func(name, store string) *v1alpha1.Task {
+		return &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: name},
+			Spec: &v1alpha1.TaskSpec{Env: []*v1alpha1.EnvVar{{Name: "TOKEN", SecretRef: &v1alpha1.SecretEnvSource{
+				Store:  store,
+				Name:   "github",
+				Key:    "token",
+				Inject: &v1alpha1.CredentialInjection{Host: "api.github.com", Header: "Authorization", Prefix: "Bearer "},
+			}}}},
+		}
+	}
+	if _, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: task("named-store", "vault")}); status.Code(err) != codes.Unimplemented {
+		t.Fatalf("expected Unimplemented for a named store, got %v", err)
+	}
+	if _, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: task("default-store", "")}); err != nil {
+		t.Fatalf("expected the default store to be accepted, got %v", err)
+	}
+}
+
 type fakeReconciler struct {
 	reconcileCount      int
 	reconcileErr        error

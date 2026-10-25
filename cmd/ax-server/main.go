@@ -49,6 +49,7 @@ func main() {
 		defaultTemplateAtespace string
 		taskCapabilitiesAdd     string
 		taskCapabilitiesDrop    string
+		secretNamespace         string
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
@@ -64,6 +65,7 @@ func main() {
 	flag.StringVar(&defaultTemplateAtespace, "template-atespace", v1alpha1.DefaultSystemNamespace, "Default Substrate ActorTemplate atespace")
 	flag.StringVar(&taskCapabilitiesAdd, "task-capabilities-add", "", "Comma-separated Linux capabilities, without the CAP_ prefix, granted to the container of every task on top of Substrate's default set (AUDIT_WRITE, KILL, NET_BIND_SERVICE), such as CHOWN,SETUID")
 	flag.StringVar(&taskCapabilitiesDrop, "task-capabilities-drop", "", "Comma-separated Linux capabilities removed from the default set of the container of every task; ALL removes the whole set")
+	flag.StringVar(&secretNamespace, "secret-namespace", "", "Kubernetes namespace of the Secrets that spec.env[].secretRef names in the default store; empty means the namespace named after the task's atespace")
 	flag.Parse()
 
 	securityContext, err := substrate.TaskSecurityContext(splitList(taskCapabilitiesAdd), splitList(taskCapabilitiesDrop))
@@ -118,6 +120,7 @@ func main() {
 		defer subClient.Close()
 		taskReconciler := controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace)
 		taskReconciler.SecurityContext = securityContext
+		taskReconciler.SecretNamespace = secretNamespace
 		reconciler = taskReconciler
 	}
 

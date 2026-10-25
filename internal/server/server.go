@@ -145,6 +145,9 @@ func (s *Server) CreateTask(ctx context.Context, req *v1alpha1.CreateTaskRequest
 	if err := v1alpha1.ValidateTask(task); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	if err := rejectUnimplemented(task.GetSpec()); err != nil {
+		return nil, err
+	}
 	if task.Metadata == nil {
 		task.Metadata = &v1alpha1.ObjectMeta{}
 	}
@@ -605,6 +608,19 @@ func (s *Server) DeleteModel(ctx context.Context, req *v1alpha1.DeleteModelReque
 		return nil, status.Errorf(codes.Internal, "deleting model: %v", err)
 	}
 	return &v1alpha1.DeleteModelResponse{}, nil
+}
+
+// rejectUnimplemented refuses TaskSpec fields that are in the API but not yet
+// acted on, so a task never runs without the credentials it asked for. Until
+// the SecretStore resource lands, every secret_ref resolves against the
+// default store, which the server's --secret-namespace flag configures.
+func rejectUnimplemented(spec *v1alpha1.TaskSpec) error {
+	for i, e := range spec.GetEnv() {
+		if ref := e.GetSecretRef(); ref != nil && ref.StoreName() != v1alpha1.DefaultSecretStore {
+			return status.Errorf(codes.Unimplemented, "spec.env[%d].secretRef.store: only the %q store is supported yet", i, v1alpha1.DefaultSecretStore)
+		}
+	}
+	return nil
 }
 
 func defaultMetadata(meta *v1alpha1.ObjectMeta, existing func(atespace, name string) *v1alpha1.ObjectMeta) *v1alpha1.ObjectMeta {

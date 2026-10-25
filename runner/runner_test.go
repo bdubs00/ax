@@ -58,6 +58,31 @@ func TestRun_StartsTaskCommandWithInjectedEnv(t *testing.T) {
 	}
 }
 
+// A secret-backed env var reaches the command as the placeholder, which the
+// egress gateway replaces on the way out.
+func TestRun_SecretRefEnvIsPlaceholder(t *testing.T) {
+	h := newHarness(t)
+	outFile := filepath.Join(t.TempDir(), "out.txt")
+	h.task.Spec.Env = []*v1alpha1.EnvVar{{Name: "MCP_TOKEN", SecretRef: &v1alpha1.SecretEnvSource{
+		Name:   "ansible-mcp",
+		Key:    "token",
+		Inject: &v1alpha1.CredentialInjection{Host: "ansible-mcp.fw-fleet.svc.cluster.local", Header: "Authorization"},
+	}}}
+	h.task.Spec.Command = []string{"sh", "-c", `echo "$MCP_TOKEN" > ` + outFile}
+
+	exit := h.runUntilCommandExits(t)
+	if exit.Err != nil || exit.ExitCode != 0 {
+		t.Fatalf("unexpected exit: %+v", exit)
+	}
+	out, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("command did not write its output: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != v1alpha1.SecretPlaceholder {
+		t.Errorf("MCP_TOKEN = %q, want %q", got, v1alpha1.SecretPlaceholder)
+	}
+}
+
 func TestRun_ReportsCommandExitCode(t *testing.T) {
 	h := newHarness(t)
 	h.task.Spec.Command = []string{"sh", "-c", "exit 3"}

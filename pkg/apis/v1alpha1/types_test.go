@@ -655,3 +655,112 @@ func TestParseEgressHost(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateTask_SecretRef(t *testing.T) {
+	ref := func(mut func(*v1alpha1.SecretEnvSource)) *v1alpha1.SecretEnvSource {
+		r := &v1alpha1.SecretEnvSource{
+			Name: "ansible-mcp",
+			Key:  "token",
+			Inject: &v1alpha1.CredentialInjection{
+				Host:   "ansible-mcp.fw-fleet.svc.cluster.local",
+				Header: "Authorization",
+				Prefix: "Bearer ",
+			},
+		}
+		if mut != nil {
+			mut(r)
+		}
+		return r
+	}
+	task := func(env ...*v1alpha1.EnvVar) *v1alpha1.Task {
+		return &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: "t", Atespace: "default"},
+			Spec:     &v1alpha1.TaskSpec{Env: env},
+		}
+	}
+	cases := []struct {
+		name string
+		task *v1alpha1.Task
+		want string // a fragment of the error, or "" for a valid task
+	}{
+		{"valid", task(&v1alpha1.EnvVar{Name: "MCP_TOKEN", SecretRef: ref(nil)}), ""},
+		{"named store", task(&v1alpha1.EnvVar{Name: "MCP_TOKEN", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Store = "vault" })}), ""},
+		{"two headers for one host", task(
+			&v1alpha1.EnvVar{Name: "A", SecretRef: ref(nil)},
+			&v1alpha1.EnvVar{Name: "B", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Inject.Header = "X-Api-Key"; r.Inject.Prefix = "" })},
+		), ""},
+		{"value and secretRef", task(&v1alpha1.EnvVar{Name: "A", Value: "x", SecretRef: ref(nil)}), "spec.env[0]: value and secretRef are mutually exclusive"},
+		{"no name", task(&v1alpha1.EnvVar{Name: "A", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Name = "" })}), "name and key are required"},
+		{"no key", task(&v1alpha1.EnvVar{Name: "A", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Key = "" })}), "name and key are required"},
+		{"name with a slash", task(&v1alpha1.EnvVar{Name: "A", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Name = "fw-fleet/token" })}), "must be a lowercase DNS subdomain"},
+		{"key with a slash", task(&v1alpha1.EnvVar{Name: "A", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Key = "a/b" })}), "may only contain letters"},
+		{"bad store", task(&v1alpha1.EnvVar{Name: "A", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Store = "Vault" })}), "spec.env[0].secretRef.store"},
+		{"no inject", task(&v1alpha1.EnvVar{Name: "A", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Inject = nil })}), "host and header are required"},
+		{"wildcard host", task(&v1alpha1.EnvVar{Name: "A", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Inject.Host = "*.example.com" })}), `"*.example.com" must be a lowercase DNS name`},
+		{"host with a port", task(&v1alpha1.EnvVar{Name: "A", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Inject.Host = "example.com:8080" })}), "must be a lowercase DNS name"},
+		{"bad header", task(&v1alpha1.EnvVar{Name: "A", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Inject.Header = "Bad Header" })}), "is not a valid request header name"},
+		{"host header", task(&v1alpha1.EnvVar{Name: "A", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Inject.Header = "Host" })}), "is not a valid request header name"},
+		{"prefix with a line break", task(&v1alpha1.EnvVar{Name: "A", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Inject.Prefix = "Bearer\r\n" })}), "must not contain line breaks"},
+		{"one header twice for one host", task(
+			&v1alpha1.EnvVar{Name: "A", SecretRef: ref(nil)},
+			&v1alpha1.EnvVar{Name: "B", SecretRef: ref(func(r *v1alpha1.SecretEnvSource) { r.Inject.Header = "authorization" })},
+		), `spec.env[1].secretRef.inject: header "authorization" for host "ansible-mcp.fw-fleet.svc.cluster.local" is already injected by env "A"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := v1alpha1.ValidateTask(tc.task)
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("ValidateTask = %v, want nil", err)
+			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+				t.Fatalf("ValidateTask = %v, want an error with %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestEnvVar_ResolvedValue(t *testing.T) {
+	if got := (&v1alpha1.EnvVar{Name: "A", Value: "x"}).ResolvedValue(); got != "x" {
+		t.Errorf("literal: got %q", got)
+	}
+	ref := &v1alpha1.SecretEnvSource{Name: "s", Key: "k"}
+	if got := (&v1alpha1.EnvVar{Name: "A", SecretRef: ref}).ResolvedValue(); got != v1alpha1.SecretPlaceholder {
+		t.Errorf("secretRef: got %q, want the placeholder", got)
+	}
+	if got := ref.StoreName(); got != v1alpha1.DefaultSecretStore {
+		t.Errorf("StoreName = %q, want %q", got, v1alpha1.DefaultSecretStore)
+	}
+}
+
+func TestTask_SecretRef_YAML(t *testing.T) {
+	in := `apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: t
+spec:
+  env:
+    - name: MCP_TOKEN
+      secretRef:
+        name: ansible-mcp
+        key: token
+        inject:
+          host: ansible-mcp.fw-fleet.svc.cluster.local
+          header: Authorization
+          prefix: "Bearer "
+`
+	var task v1alpha1.Task
+	if err := yaml.Unmarshal([]byte(in), &task); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	ref := task.GetSpec().GetEnv()[0].GetSecretRef()
+	if ref.GetName() != "ansible-mcp" || ref.GetKey() != "token" || ref.GetInject().GetPrefix() != "Bearer " {
+		t.Fatalf("unexpected secretRef: %v", ref)
+	}
+	out, err := yaml.Marshal(&task)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(out), "secretRef:") || !strings.Contains(string(out), "header: Authorization") {
+		t.Errorf("secretRef did not survive a round trip:\n%s", out)
+	}
+}

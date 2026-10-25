@@ -1142,3 +1142,68 @@ func TestTaskReconciler_TemplateErrorFallsBackWithoutSecurityContext(t *testing.
 		t.Errorf("expected the actor on the default template, got %v", mockSrv.createdActors)
 	}
 }
+
+// A secret-backed env var reaches the template as the placeholder, and its
+// host gets a header replacement in the actor's egress policy, even when the
+// task names no egress hosts. The credential URI names the Secret in the
+// server's secret namespace, or in the namespace of the atespace without one.
+func TestTaskReconciler_SecretRef(t *testing.T) {
+	ctx := context.Background()
+	newTask := func(name string) *v1alpha1.Task {
+		return &v1alpha1.Task{
+			Metadata: &v1alpha1.ObjectMeta{Name: name, Atespace: "team-a"},
+			Spec: &v1alpha1.TaskSpec{
+				Image: "ghcr.io/my-org/my-image",
+				Env: []*v1alpha1.EnvVar{{Name: "MCP_TOKEN", SecretRef: &v1alpha1.SecretEnvSource{
+					Name: "ansible-mcp",
+					Key:  "token",
+					Inject: &v1alpha1.CredentialInjection{
+						Host:   "ansible-mcp.fw-fleet.svc.cluster.local",
+						Header: "Authorization",
+						Prefix: "Bearer ",
+					},
+				}}},
+			},
+		}
+	}
+
+	for _, tc := range []struct {
+		name, namespace, wantURI string
+	}{
+		{"atespace namespace", "", "ate-secret://k8s.io/default/team-a/ansible-mcp/token"},
+		{"server namespace", "fw-fleet", "ate-secret://k8s.io/default/fw-fleet/ansible-mcp/token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mockSrv := &mockControlServer{}
+			reconciler := startMockSubstrate(t, mockSrv)
+			reconciler.SecretNamespace = tc.namespace
+			if _, err := reconciler.Reconcile(ctx, newTask("secret-task")); err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+			if len(mockSrv.createdTemplates) != 1 {
+				t.Fatalf("expected 1 template, got %d", len(mockSrv.createdTemplates))
+			}
+			var value string
+			for _, e := range mockSrv.createdTemplates[0].GetContainers()[0].GetEnv() {
+				if e.GetName() == "MCP_TOKEN" {
+					value = e.GetValue()
+				}
+			}
+			if value != v1alpha1.SecretPlaceholder {
+				t.Errorf("MCP_TOKEN = %q in the template, want the placeholder", value)
+			}
+			policy := mockSrv.egressPolicies["secret-task"]
+			if policy == nil || len(policy.GetRules()) != 1 {
+				t.Fatalf("expected one egress rule, got %v", policy)
+			}
+			rule := policy.GetRules()[0].GetHttps()
+			headers := rule.GetEffects().GetReplaceHeaders()
+			if rule == nil || rule.GetHostnames()[0] != "ansible-mcp.fw-fleet.svc.cluster.local" || len(headers) != 1 {
+				t.Fatalf("unexpected rule: %v", policy.GetRules()[0])
+			}
+			if headers[0].GetHeader() != "Authorization" || headers[0].GetPrefix() != "Bearer " || headers[0].GetCredentialUri() != tc.wantURI {
+				t.Errorf("unexpected header replacement: %v", headers[0])
+			}
+		})
+	}
+}

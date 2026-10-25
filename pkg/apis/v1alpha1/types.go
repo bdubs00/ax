@@ -450,5 +450,91 @@ func ValidateTask(t *Task) error {
 		}
 		seen[p] = r.GetName()
 	}
-	return validateEgress(spec)
+	if err := validateEgress(spec); err != nil {
+		return err
+	}
+	return validateSecretRefs(spec)
+}
+
+// DefaultSecretStore is the store a secret_ref uses when it names none.
+const DefaultSecretStore = "default"
+
+// SecretPlaceholder is the value a task sees for an env var backed by a
+// secret_ref. The egress gateway replaces it with the secret on the way out.
+const SecretPlaceholder = "ax-placeholder"
+
+// StoreName is the SecretStore a secret_ref resolves against.
+func (r *SecretEnvSource) StoreName() string {
+	if r.GetStore() != "" {
+		return r.GetStore()
+	}
+	return DefaultSecretStore
+}
+
+// ResolvedValue is the value the task's environment gets for e: the literal
+// value, or SecretPlaceholder when the variable is backed by a secret_ref.
+func (e *EnvVar) ResolvedValue() string {
+	if e.GetSecretRef() != nil {
+		return SecretPlaceholder
+	}
+	return e.GetValue()
+}
+
+var (
+	headerRegexp = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+	// secretNameRegexp and secretKeyRegexp follow Kubernetes' rules for Secret
+	// names (DNS subdomains) and data keys. Both end up as path segments of the
+	// credential URI, so neither may contain "/".
+	secretNameRegexp = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
+	secretKeyRegexp  = regexp.MustCompile(`^[-._a-zA-Z0-9]+$`)
+)
+
+// validateSecretRefs reports the first problem with the secret_ref of an env
+// var: a value next to it, a missing or malformed name, key, store, or
+// injection, or a header that two variables inject for one host.
+func validateSecretRefs(spec *TaskSpec) error {
+	injected := map[string]string{}
+	for i, e := range spec.GetEnv() {
+		field := fmt.Sprintf("spec.env[%d]", i)
+		ref := e.GetSecretRef()
+		if ref == nil {
+			continue
+		}
+		if e.GetValue() != "" {
+			return fmt.Errorf("%s: value and secretRef are mutually exclusive", field)
+		}
+		if ref.GetName() == "" || ref.GetKey() == "" {
+			return fmt.Errorf("%s.secretRef: name and key are required", field)
+		}
+		if len(ref.GetName()) > maxHostLength || !secretNameRegexp.MatchString(ref.GetName()) {
+			return fmt.Errorf("%s.secretRef.name: %q must be a lowercase DNS subdomain", field, ref.GetName())
+		}
+		if len(ref.GetKey()) > maxHostLength || !secretKeyRegexp.MatchString(ref.GetKey()) {
+			return fmt.Errorf("%s.secretRef.key: %q may only contain letters, digits, '-', '_', and '.'", field, ref.GetKey())
+		}
+		if ref.GetStore() != "" {
+			if err := ValidateName(ref.GetStore()); err != nil {
+				return fmt.Errorf("%s.secretRef.store: %w", field, err)
+			}
+		}
+		inj := ref.GetInject()
+		if inj == nil {
+			return fmt.Errorf("%s.secretRef.inject: host and header are required", field)
+		}
+		if err := validateHost(inj.GetHost(), false); err != nil {
+			return fmt.Errorf("%s.secretRef.inject.host: %w", field, err)
+		}
+		if !headerRegexp.MatchString(inj.GetHeader()) || strings.EqualFold(inj.GetHeader(), "host") {
+			return fmt.Errorf("%s.secretRef.inject.header: %q is not a valid request header name", field, inj.GetHeader())
+		}
+		if strings.ContainsAny(inj.GetPrefix(), "\r\n") {
+			return fmt.Errorf("%s.secretRef.inject.prefix: must not contain line breaks", field)
+		}
+		k := inj.GetHost() + " " + strings.ToLower(inj.GetHeader())
+		if other, dup := injected[k]; dup {
+			return fmt.Errorf("%s.secretRef.inject: header %q for host %q is already injected by env %q", field, inj.GetHeader(), inj.GetHost(), other)
+		}
+		injected[k] = e.GetName()
+	}
+	return nil
 }

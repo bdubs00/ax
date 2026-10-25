@@ -97,7 +97,37 @@ message EgressSpec {
 
 message EnvVar {
   string name = 1;
+  // value is a literal value. Exactly one of value and secret_ref is set.
   string value = 2;
+  // secret_ref injects a secret into the task's outbound requests instead of
+  // exposing it to the task. The variable is set to a placeholder, and Agent
+  // Substrate's egress gateway replaces the named request header with the
+  // secret on requests to the given host.
+  SecretEnvSource secret_ref = 3;
+}
+
+// SecretEnvSource names a secret in one of the atespace's SecretStores, and how
+// the egress gateway injects it.
+message SecretEnvSource {
+  // store is the SecretStore holding the secret. Empty means "default".
+  string store = 4;
+  string name = 1;
+  string key = 2;
+  CredentialInjection inject = 3;
+}
+
+// CredentialInjection tells the egress gateway where to put a secret: in the
+// given request header, on requests to host. The rule of spec.egress.hosts
+// that names host decides the protocol: an http:// or https:// entry keeps
+// its protocol and port, and a host without an entry, or with a TLS entry, is
+// intercepted as HTTPS.
+message CredentialInjection {
+  // host is the DNS name requests are sent to, such as "api.stripe.com".
+  string host = 1;
+  // header is the request header the gateway replaces, such as "Authorization".
+  string header = 2;
+  // prefix is prepended to the secret, such as "Bearer " (including the space).
+  string prefix = 3;
 }
 
 message ResourcesSpec {

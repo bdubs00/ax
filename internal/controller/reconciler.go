@@ -80,6 +80,13 @@ type TaskReconciler struct {
 	// a change reaches the templates provisioned after it, and an existing task
 	// keeps its template and actor.
 	SecurityContext *ateapipb.SecurityContext
+
+	// SecretNamespace is the Kubernetes namespace that holds the Secrets of the
+	// default SecretStore, from the server's --secret-namespace flag. Empty
+	// means the namespace named after the task's atespace, as the default of
+	// SecretStore.spec.kubernetes.namespace. Substrate's credential provider
+	// must grant the atespace access to it.
+	SecretNamespace string
 }
 
 // NewTaskReconciler creates a new TaskReconciler.
@@ -159,7 +166,9 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	if task.Spec != nil {
 		for _, e := range task.Spec.Env {
 			if e.Name != "" {
-				extraEnv[e.Name] = e.Value
+				// A secret-backed variable gets a placeholder; the egress
+				// gateway puts the secret into the requests that carry it.
+				extraEnv[e.Name] = e.ResolvedValue()
 			}
 		}
 	}
@@ -222,10 +231,13 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 	// Give the actor its egress policy before it first runs. Substrate
 	// denies every connection of an actor without one, so a task that names
-	// no egress hosts has no network access. Tasks are immutable, and the
-	// policy is created once.
-	if egress := task.Spec.GetEgress(); len(egress.GetHosts()) > 0 {
-		rules, err := egressRules(egress)
+	// no egress hosts and no secret_ref has no network access. Tasks are
+	// immutable, and the policy is created once.
+	secretNamespace := r.SecretNamespace
+	if secretNamespace == "" {
+		secretNamespace = atespace
+	}
+	if rules, err := egressRules(task.Spec, secretNamespace); err != nil || len(rules) > 0 {
 		if err == nil {
 			err = r.client.EnsureActorEgressPolicy(ctx, atespace, actorName, rules)
 		}

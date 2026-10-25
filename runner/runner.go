@@ -157,7 +157,7 @@ func Run(ctx context.Context, cfg Config) error {
 	metadataURL := metaServer.MetadataURL()
 	_ = os.Setenv("AX_METADATA_URL", metadataURL)
 	for _, e := range cfg.Task.GetSpec().GetEnv() {
-		_ = os.Setenv(e.GetName(), e.GetValue())
+		_ = os.Setenv(e.GetName(), e.ResolvedValue())
 	}
 	defer func() {
 		slog.Info("shutting down metadata server")
@@ -248,11 +248,12 @@ func reportExit(cfg Config, cmd *exec.Cmd, err error) {
 }
 
 // commandEnv builds the environment for the task command: the runner's own
-// environment, the metadata URL, and the Task's spec.env entries.
+// environment, the metadata URL, and the Task's spec.env entries, with a
+// placeholder for an entry backed by a secret_ref.
 func commandEnv(task *v1alpha1.Task, metadataURL string) []string {
 	env := append(os.Environ(), "AX_METADATA_URL="+metadataURL)
 	for _, e := range task.GetSpec().GetEnv() {
-		env = append(env, fmt.Sprintf("%s=%s", e.GetName(), e.GetValue()))
+		env = append(env, fmt.Sprintf("%s=%s", e.GetName(), e.ResolvedValue()))
 	}
 	return env
 }
